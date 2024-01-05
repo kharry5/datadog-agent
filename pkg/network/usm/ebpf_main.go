@@ -10,8 +10,8 @@ package usm
 import (
 	"errors"
 	"fmt"
+	"io"
 	"math"
-	"strings"
 	"time"
 	"unsafe"
 
@@ -33,6 +33,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/network/tracer/offsetguess"
 	"github.com/DataDog/datadog-agent/pkg/network/usm/buildmode"
 	"github.com/DataDog/datadog-agent/pkg/network/usm/utils"
+	"github.com/DataDog/datadog-agent/pkg/util/kernel"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 	manager "github.com/DataDog/ebpf-manager"
 )
@@ -72,6 +73,7 @@ type ebpfProgram struct {
 	cfg                   *config.Config
 	tailCallRouter        []manager.TailCallRoute
 	connectionProtocolMap *ebpf.Map
+	kversion              kernel.Version
 
 	enabledProtocols  []*protocols.ProtocolSpec
 	disabledProtocols []*protocols.ProtocolSpec
@@ -82,6 +84,11 @@ type ebpfProgram struct {
 }
 
 func newEBPFProgram(c *config.Config, sockFD, connectionProtocolMap *ebpf.Map, bpfTelemetry *errtelemetry.EBPFTelemetry) (*ebpfProgram, error) {
+	kversion, err := kernel.HostVersion()
+	if err != nil {
+		log.Warnf("unable to detect kernel version. some features might be disabled: %s", err)
+	}
+
 	mgr := &manager.Manager{
 		Maps: []*manager.Map{
 			{Name: protocols.TLSDispatcherProgramsMap},
@@ -135,6 +142,7 @@ func newEBPFProgram(c *config.Config, sockFD, connectionProtocolMap *ebpf.Map, b
 		Manager:               errtelemetry.NewManager(mgr, bpfTelemetry),
 		cfg:                   c,
 		connectionProtocolMap: connectionProtocolMap,
+		kversion:              kversion,
 	}
 
 	opensslSpec.Factory = newSSLProgramProtocolFactory(mgr, sockFD, bpfTelemetry)
@@ -353,6 +361,10 @@ func (e *ebpfProgram) init(buf bytecode.AssetReader, options manager.Options) er
 		manager.ConstantEditor{Name: "ephemeral_range_begin", Value: uint64(begin)},
 		manager.ConstantEditor{Name: "ephemeral_range_end", Value: uint64(end)})
 
+	// Enable event flushes from socket filter programs if possible
+	isDirectFlushSupported := e.kversion >= kernel.VersionCode(5, 4, 0)
+	utils.AddBoolConst(&options, isDirectFlushSupported, "direct_flush_supported")
+
 	for _, p := range e.Manager.Probes {
 		options.ActivatedProbes = append(options.ActivatedProbes, &manager.ProbeSelector{ProbeIdentificationPair: p.ProbeIdentificationPair})
 	}
@@ -435,25 +447,22 @@ func getAssetName(module string, debug bool) string {
 	return fmt.Sprintf("%s.o", module)
 }
 
-func (e *ebpfProgram) dumpMapsHandler(_ *manager.Manager, mapName string, currentMap *ebpf.Map) string {
-	var output strings.Builder
-
+func (e *ebpfProgram) dumpMapsHandler(w io.Writer, _ *manager.Manager, mapName string, currentMap *ebpf.Map) {
 	switch mapName {
 	case connectionStatesMap: // maps/connection_states (BPF_MAP_TYPE_HASH), key C.conn_tuple_t, value C.__u32
-		output.WriteString("Map: '" + mapName + "', key: 'C.conn_tuple_t', value: 'C.__u32'\n")
+		io.WriteString(w, "Map: '"+mapName+"', key: 'C.conn_tuple_t', value: 'C.__u32'\n")
 		iter := currentMap.Iterate()
 		var key http.ConnTuple
 		var value uint32
 		for iter.Next(unsafe.Pointer(&key), unsafe.Pointer(&value)) {
-			output.WriteString(spew.Sdump(key, value))
+			spew.Fdump(w, key, value)
 		}
 
 	default: // Go through enabled protocols in case one of them now how to handle the current map
 		for _, p := range e.enabledProtocols {
-			p.Instance.DumpMaps(&output, mapName, currentMap)
+			p.Instance.DumpMaps(w, mapName, currentMap)
 		}
 	}
-	return output.String()
 }
 
 func (e *ebpfProgram) getProtocolStats() map[protocols.ProtocolType]interface{} {
